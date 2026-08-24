@@ -1,0 +1,298 @@
+# Ref: https://docs.github.com/en/actions/reference/workflow-syntax-for-github-actions
+
+on:
+  workflow_dispatch:
+    inputs:
+      services:
+        description: 'Comma separated names of services to build(in small letters).'
+        required: true
+        default: 'chalice,frontend'
+
+name: Build patches from main branch, Raise PR to Main, and Push to tag
+
+jobs:
+  deploy:
+    name: Build Patch from main
+    runs-on: ubuntu-latest
+    env:
+      DEPOT_TOKEN: ${{ secrets.DEPOT_TOKEN }}
+      DEPOT_PROJECT_ID: ${{ secrets.DEPOT_PROJECT_ID }}
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v5
+      with:
+        fetch-depth: 0
+        token: ${{ secrets.GITHUB_TOKEN }}
+    - name: Rebase with main branch, to make sure the code has latest main changes
+      if: github.ref != 'refs/heads/main'
+      run: |
+        git remote -v
+        git config --global user.email "action@github.com"
+        git config --global user.name "GitHub Action"
+        git config --global rebase.autoStash true
+        git fetch origin main:main
+        git rebase main
+        git log -3
+
+    - name: Downloading yq
+      run: |
+        VERSION="v4.42.1"
+        sudo wget https://github.com/mikefarah/yq/releases/download/${VERSION}/yq_linux_amd64 -O /usr/bin/yq
+        sudo chmod +x /usr/bin/yq
+
+    # Configure AWS credentials for the first registry
+    - name: Configure AWS credentials for RELEASE_ARM_REGISTRY
+      uses: aws-actions/configure-aws-credentials@v5
+      with:
+        aws-access-key-id: ${{ secrets.AWS_DEPOT_ACCESS_KEY }}
+        aws-secret-access-key: ${{ secrets.AWS_DEPOT_SECRET_KEY }}
+        aws-region: ${{ secrets.AWS_DEPOT_DEFAULT_REGION }}
+
+    - name: Login to Amazon ECR for RELEASE_ARM_REGISTRY
+      id: login-ecr-arm
+      run: |
+        aws ecr get-login-password --region ${{ secrets.AWS_DEPOT_DEFAULT_REGION }} | docker login --username AWS --password-stdin ${{ secrets.RELEASE_ARM_REGISTRY }}
+        aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin ${{ secrets.RELEASE_OSS_REGISTRY }}
+
+    - uses: depot/setup-action@v1
+      env:
+        DEPOT_TOKEN: ${{ secrets.DEPOT_TOKEN }}
+    - name: Get HEAD Commit ID
+      run: echo "HEAD_COMMIT_ID=$(git rev-parse HEAD)" >> $GITHUB_ENV
+    - name: Define Branch Name
+      run: echo "BRANCH_NAME=patch/main/${HEAD_COMMIT_ID}" >> $GITHUB_ENV
+    - name: Set Remote with GITHUB_TOKEN
+      run: |
+        git config --unset http.https://github.com/.extraheader
+        git remote set-url origin https://x-access-token:${{ secrets.ACTIONS_COMMMIT_TOKEN }}@github.com/${{ github.repository }}.git
+
+    - name: Build
+      id: build-image
+      env:
+        DOCKER_REPO_ARM: ${{ secrets.RELEASE_ARM_REGISTRY }}
+        DOCKER_REPO_OSS: ${{ secrets.RELEASE_OSS_REGISTRY }}
+        MSAAS_REPO_CLONE_TOKEN: ${{ secrets.MSAAS_REPO_CLONE_TOKEN }}
+        MSAAS_REPO_URL: ${{ secrets.MSAAS_REPO_URL }}
+        MSAAS_REPO_FOLDER: /tmp/msaas
+        SERVICES_INPUT: ${{ github.event.inputs.services }}
+      run: |
+        #!/bin/bash
+        set -euo pipefail
+
+        # Configuration
+        readonly WORKING_DIR=$(pwd)
+        readonly BUILD_SCRIPT_NAME="build.sh"
+        readonly BACKEND_SERVICES_FILE="/tmp/backend.txt"
+        readonly EE_BACKEND_SERVICES_FILE="/tmp/ee_backend.txt"
+
+        # Initialize git configuration and create unique branch
+        setup_git() {
+            git config --local user.email "action@github.com"
+            git config --local user.name "GitHub Action"
+            
+            # Check if branch exists on remote
+            local final_branch="$BRANCH_NAME"
+            if git ls-remote --heads origin "$BRANCH_NAME" | grep -q "$BRANCH_NAME"; then
+                echo "Branch $BRANCH_NAME already exists, creating unique branch name"
+                local random_suffix=$(date +%s)-$RANDOM
+                final_branch="${BRANCH_NAME}-${random_suffix}"
+                echo "New branch name: $final_branch"
+                # Export to environment for later use
+                echo "BRANCH_NAME=$final_branch" >> $GITHUB_ENV
+                export BRANCH_NAME="$final_branch"
+            fi
+            
+            git checkout -b "$final_branch"
+        }
+
+        # Get and increment image version
+        image_version() {
+            local service=$1
+            local chart_path="$WORKING_DIR/scripts/helmcharts/openreplay/charts/$service/Chart.yaml"
+            local current_version new_version
+
+            current_version=$(yq eval '.AppVersion' "$chart_path")
+            new_version=$(echo "$current_version" | awk -F. '{$NF += 1; print $1"."$2"."$3}')
+            echo "$new_version"
+        }
+
+        # Clone MSAAS repository if not exists
+        clone_msaas() {
+            if [[ ! -d "$MSAAS_REPO_FOLDER" ]]; then
+                git clone -b dev --recursive "https://x-access-token:${MSAAS_REPO_CLONE_TOKEN}@${MSAAS_REPO_URL}" "$MSAAS_REPO_FOLDER"
+                cd "$MSAAS_REPO_FOLDER"
+                cd openreplay && git fetch origin && git checkout main
+                git log -1
+                cd "$MSAAS_REPO_FOLDER"
+                bash git-init.sh
+                git checkout
+            fi
+        }
+
+        # Build managed services
+        build_managed() {
+            local service=$1
+            local version=$2
+            local arch='linux/amd64,linux/arm64'
+
+            echo "Building managed service: $service"
+            clone_msaas
+
+            if [[ $service == 'chalice' ]]; then
+                cd "$MSAAS_REPO_FOLDER/openreplay/api"
+            else
+                cd "$MSAAS_REPO_FOLDER/openreplay/$service"
+            fi
+
+            local build_cmd="IMAGE_TAG=$version DOCKER_RUNTIME=depot DOCKER_BUILD_ARGS=--push ARCH=$arch DOCKER_REPO=$DOCKER_REPO_ARM PUSH_IMAGE=0 bash build.sh"
+
+            echo "Executing: $build_cmd"
+            if ! eval "$build_cmd" 2>&1; then
+                echo "Build failed for $service"
+                exit 1
+            fi
+        }
+
+        # Build service with given arguments
+        build_service() {
+            local service=$1
+            local version=$2
+            local build_args=$3
+            local build_script=${4:-$BUILD_SCRIPT_NAME}
+            local docker_repo=${5:-$DOCKER_REPO_OSS}
+            local docker_arch=${6:-amd64}
+
+            local command="IMAGE_TAG=$version DOCKER_RUNTIME=depot DOCKER_BUILD_ARGS=--push ARCH=$docker_arch DOCKER_REPO=$docker_repo PUSH_IMAGE=0 bash $build_script $build_args"
+            echo "Executing: $command"
+            if ! eval "$command"; then
+                echo "Build failed for $service with args: $build_args"
+                exit 1
+            fi
+        }
+
+        # Update chart version and commit changes
+        update_chart_version() {
+            local service=$1
+            local version=$2
+            local chart_path="$WORKING_DIR/scripts/helmcharts/openreplay/charts/$service/Chart.yaml"
+
+            # Ensure we're in the original working directory/repository
+            cd "$WORKING_DIR"
+            yq eval ".AppVersion = \"$version\"" -i "$chart_path"
+            git add "$chart_path"
+            git commit -m "Increment $service chart version to $version"
+            git push --set-upstream origin "$BRANCH_NAME"
+            cd -
+        }
+
+        # Main execution
+        main() {
+            setup_git
+
+            # Get backend services list
+            ls backend/cmd >"$BACKEND_SERVICES_FILE"
+            # Get EE-only backend services list
+            if [[ -d ee/backend/cmd ]]; then
+                ls ee/backend/cmd >"$EE_BACKEND_SERVICES_FILE"
+            else
+                touch "$EE_BACKEND_SERVICES_FILE"
+            fi
+
+            # Parse services input (fix for GitHub Actions syntax)
+            echo "Services: ${SERVICES_INPUT:-$1}"
+            IFS=',' read -ra services <<<"${SERVICES_INPUT:-$1}"
+
+            # Process each service
+            for service in "${services[@]}"; do
+                echo "Processing service: $service"
+                cd "$WORKING_DIR"
+
+                local foss_build_args="" ee_build_args="" build_script="$BUILD_SCRIPT_NAME"
+                local is_ee_only=false
+
+                # Determine build configuration based on service type
+                if grep -qx "$service" "$BACKEND_SERVICES_FILE"; then
+                    # Backend service (FOSS)
+                    cd backend
+                    foss_build_args="nil $service"
+                    ee_build_args="ee $service"
+                elif grep -qx "$service" "$EE_BACKEND_SERVICES_FILE"; then
+                    # EE-only backend service
+                    cd backend
+                    foss_build_args="nil $service"
+                    ee_build_args="ee $service"
+                    # EE-only services: no FOSS build
+                    [[ $service == "assist-api" ]] && is_ee_only=true
+                else
+                    # Non-backend service
+                    case "$service" in
+                    chalice | alerts | crons)
+                        cd "$WORKING_DIR/api"
+                        ;;
+                    *)
+                        cd "$service"
+                        ;;
+                    esac
+
+                    # Special build scripts for alerts/crons
+                    if [[ $service == 'alerts' || $service == 'crons' ]]; then
+                        build_script="build_${service}.sh"
+                    fi
+
+                    ee_build_args="ee"
+                fi
+
+                # Get version and build
+                local version
+                version=$(image_version "$service")
+
+                # Build FOSS and EE versions (skip FOSS for assist-api)
+                if [[ $is_ee_only == false ]]; then
+                    build_service "$service" "$version" "$foss_build_args" "$build_script"
+                    build_service "$service" "$version" "$foss_build_args" "$build_script" "$DOCKER_REPO_ARM" "arm64"
+                fi
+                build_service "$service" "${version}-ee" "$ee_build_args" "$build_script"
+
+                # Building managed
+                case "$service" in
+                chalice | frontend)
+                    build_managed "$service" "$version"
+                    ;;
+                esac
+                # Update chart and commit
+                update_chart_version "$service" "$version"
+            done
+            cd "$WORKING_DIR"
+
+            # Cleanup
+            rm -f "$BACKEND_SERVICES_FILE"
+            rm -f "$EE_BACKEND_SERVICES_FILE"
+        }
+
+        echo "Working directory: $WORKING_DIR"
+        # Run main function with all arguments
+        main "$SERVICES_INPUT"
+        
+
+    - name: Create Pull Request
+      uses: repo-sync/pull-request@v2
+      with:
+        github_token: ${{ secrets.ACTIONS_COMMMIT_TOKEN }}
+        source_branch: ${{ env.BRANCH_NAME }}
+        destination_branch: "main"
+        pr_title: "Updated patch build from main ${{ env.HEAD_COMMIT_ID }}"
+        pr_body: | 
+          This PR updates the Helm chart version after building the patch from $HEAD_COMMIT_ID.
+          Once this PR is merged, tag update job will run automatically.
+
+    # - name: Debug Job
+    #   if: ${{ failure() }}
+    #   uses: mxschmitt/action-tmate@v3
+    #   env:
+    #     DOCKER_REPO_ARM: ${{ secrets.RELEASE_ARM_REGISTRY }}
+    #     DOCKER_REPO_OSS: ${{ secrets.RELEASE_OSS_REGISTRY }}
+    #     MSAAS_REPO_CLONE_TOKEN: ${{ secrets.MSAAS_REPO_CLONE_TOKEN }}
+    #     MSAAS_REPO_URL: ${{ secrets.MSAAS_REPO_URL }}
+    #     MSAAS_REPO_FOLDER: /tmp/msaas
+    #   with:
+    #     limit-access-to-actor: true

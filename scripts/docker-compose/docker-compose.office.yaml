@@ -1,0 +1,26 @@
+
+# vim: ft=yaml
+# Office deployment override - replaces Caddy with Nginx Proxy Manager
+# Usage: docker compose -f docker-compose.yaml -f docker-compose.office.yaml up -d
+#
+# NPM (Nginx Proxy Manager) handles TLS termination externally.
+# This override:
+#   1. Exposes nginx on host port 8880 (NPM proxies to this)
+#   2. Removes Caddy service entirely
+#   3. Exposes MinIO console on host port 9001
+
+version: '3'
+
+services:
+  nginx-openreplay:
+    ports:
+      - "8880:80"
+
+  # Disable Caddy - NPM handles TLS
+  caddy:
+    profiles:
+      - "disabled"
+
+volumes:
+  caddy_data:
+  caddy_config:
